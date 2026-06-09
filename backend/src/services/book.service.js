@@ -6,7 +6,173 @@ import { Board } from '../models/Board.js';
 import { generateSlug } from '../utils/slug.js';
 
 /**
- * Get all books with optional filters
+ * Quran book filter - always include Quran in results
+ */
+function quranBookFilter() {
+  return {
+    $or: [
+      { slug: 'the-holy-quran' },
+      { subject_slug: 'the-holy-quran' },
+      { title: /quran/i },
+      { subject: /quran/i },
+    ],
+  };
+}
+
+/**
+ * Escape special regex characters
+ */
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Resolve user's board and program IDs from their profile
+ * Matches source: packages/lib/content/bookFilter.js::resolveUserContentProfile
+ */
+export async function resolveUserContentProfile(user) {
+  const boardName = user?.board || user?.student_profile?.board;
+  const gradeName = user?.grade || user?.student_profile?.grade;
+  let boardId = user?.student_profile?.board_id || null;
+  let programId = user?.student_profile?.active_program_id || null;
+
+  if (!boardId && boardName) {
+    const boardDoc = await Board.findOne({
+      $or: [
+        { name: boardName },
+        { name: new RegExp(`^${escapeRegex(boardName)}$`, 'i') },
+        { short_code: boardName },
+        { name: new RegExp(escapeRegex(boardName.split(' ').slice(-1)[0] || boardName), 'i') },
+      ],
+    })
+      .select('_id name')
+      .lean();
+    boardId = boardDoc?._id || null;
+  }
+
+  if (!programId && gradeName) {
+    const gradeCore = gradeName.split('(')[0].trim();
+    const programDoc = await Program.findOne({
+      $or: [
+        { name: gradeName },
+        { name: gradeCore },
+        { slug: generateSlug(gradeName) },
+        { slug: generateSlug(gradeCore) },
+        { name: new RegExp(`^${escapeRegex(gradeCore)}$`, 'i') },
+      ],
+    })
+      .select('_id name slug')
+      .lean();
+    programId = programDoc?._id || null;
+  }
+
+  return { boardId, programId, boardName, gradeName };
+}
+
+/**
+ * Build book filter based on user's board and grade
+ * Matches source: packages/lib/content/bookFilter.js::buildBookFilter
+ */
+export function buildBookFilter({ boardId, programId, boardName, gradeName }) {
+  const scopeParts = [{ is_current_edition: { $ne: false } }];
+
+  if (boardId) {
+    scopeParts.push({ board_id: boardId });
+  }
+
+  if (programId) {
+    scopeParts.push({ program_id: programId });
+  } else if (gradeName) {
+    const gradeCore = gradeName.split('(')[0].trim();
+    scopeParts.push({
+      $or: [
+        { grade: gradeName },
+        { 'metadata.grade': gradeName },
+        { 'metadata.grade_level': gradeName },
+        { 'metadata.grade_level': new RegExp(`^${escapeRegex(gradeCore)}$`, 'i') },
+        { title: new RegExp(escapeRegex(gradeCore), 'i') },
+      ],
+    });
+  }
+
+  if (scopeParts.length === 1) {
+    return { is_current_edition: { $ne: false } };
+  }
+
+  return {
+    $or: [quranBookFilter(), { $and: scopeParts }],
+  };
+}
+
+/**
+ * Sanitize book data for unauthenticated users
+ * - Hide sensitive metadata (solutions, answers, teacher_notes)
+ * - Limit content preview to first 2 blocks
+ * - Truncate SEO descriptions
+ */
+function sanitizeBookForPublic(book) {
+  const sanitized = { ...book.toObject() };
+  
+  if (sanitized.metadata) {
+    const { solutions, answers, teacher_notes, ...restMetadata } = sanitized.metadata;
+    sanitized.metadata = restMetadata;
+  }
+  
+  if (sanitized.content_blocks && Array.isArray(sanitized.content_blocks)) {
+    sanitized.content_blocks = sanitized.content_blocks.slice(0, 2);
+  }
+  
+  if (sanitized.seo?.meta_description) {
+    sanitized.seo = {
+      ...sanitized.seo,
+      meta_description: sanitized.seo.meta_description.substring(0, 150) + '...'
+    };
+  }
+  
+  return sanitized;
+}
+
+/**
+ * Get books with user-aware filtering
+ * - Authenticated users: personalized results based on board/grade
+ * - Unauthenticated users: public, current edition books only (sanitized)
+ * Matches source: apps/student/app/api/books/route.ts
+ */
+export async function getBooksForUser(user = null, additionalFilters = {}) {
+  let filter = {};
+
+  if (user) {
+    // Authenticated user - apply personalized filtering
+    const profile = await resolveUserContentProfile(user);
+    filter = buildBookFilter(profile);
+  } else {
+    // Unauthenticated - show only public, current edition books
+    filter = {
+      is_current_edition: { $ne: false },
+      is_live: true,
+      is_public: true
+    };
+  }
+
+  // Merge additional filters
+  filter = { ...filter, ...additionalFilters };
+
+  const books = await Book.find(filter)
+    .sort({ title: 1 })
+    .populate('board_id', 'name short_code')
+    .populate('program_id', 'name slug')
+    .lean();
+
+  // Sanitize for unauthenticated users
+  if (!user) {
+    return books.map(sanitizeBookForPublic);
+  }
+
+  return books;
+}
+
+/**
+ * Get all books with optional filters (legacy method)
  */
 export async function getBooks({ boardId, programId, classLevel, subject, grade, editionYear } = {}) {
   const query = {};
@@ -51,7 +217,7 @@ export async function getBooksByProgramBoardGrade(programId, boardId, grade) {
  */
 export async function getCurrentEditionBooks(filters = {}) {
   const query = { ...filters, is_current_edition: true };
-  
+
   const books = await Book.find(query)
     .populate('board', 'name slug')
     .populate('program', 'name slug')
@@ -65,7 +231,7 @@ export async function getCurrentEditionBooks(filters = {}) {
  */
 export async function getBookBySlugWithEdition(slug, editionYear) {
   const query = { slug };
-  
+
   if (editionYear) {
     query.edition_year = editionYear;
   } else {
@@ -117,7 +283,7 @@ export async function createBook(bookData) {
 
   // Check if book with this slug exists
   const existingBook = await Book.findOne({ slug });
-  
+
   if (existingBook) {
     // If creating a new edition, archive the previous current edition
     if (bookData.edition_year) {
@@ -132,12 +298,12 @@ export async function createBook(bookData) {
     }
   }
 
-  const book = await Book.create({ 
-    ...bookData, 
+  const book = await Book.create({
+    ...bookData,
     slug,
     is_current_edition: bookData.is_current_edition ?? true
   });
-  
+
   // Link previous edition if archiving
   if (existingBook && bookData.edition_year) {
     await Book.findByIdAndUpdate(existingBook._id, {
@@ -153,7 +319,7 @@ export async function createBook(bookData) {
  */
 export async function updateBook(bookId, updateData) {
   const book = await Book.findById(bookId);
-  
+
   if (!book) {
     const error = new Error('Book not found');
     error.code = 'BOOK_NOT_FOUND';
