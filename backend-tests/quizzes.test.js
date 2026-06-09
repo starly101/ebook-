@@ -31,7 +31,7 @@ describe('Quizzes Module', () => {
       const percentage = (score / correctAnswers.length) * 100;
       
       assert.strictEqual(score, 2, 'Should count correct answers');
-      assert.strictEqual(percentage, 66.67, 'Should calculate percentage');
+      assert.ok(Math.abs(percentage - 66.67) < 0.01, 'Should calculate percentage');
     });
 
     it('should update user progress on quiz completion', () => {
